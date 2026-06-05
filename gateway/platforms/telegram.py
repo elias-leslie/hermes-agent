@@ -3244,6 +3244,16 @@ class TelegramAdapter(BasePlatformAdapter):
         query_thread_id = getattr(query_message, "message_thread_id", None)
         query_user_name = getattr(query.from_user, "first_name", None)
 
+        # --- Pulse onboarding / feedback callbacks ---
+        if data.startswith("pulse:"):
+            try:
+                from gateway.platforms.pulse_ui import handle_pulse_callback
+                await handle_pulse_callback(self, query, data)
+            except Exception as exc:
+                logger.error("Pulse Telegram callback failed: %s", exc, exc_info=True)
+                await query.answer(text="Pulse action failed — check gateway logs.")
+            return
+
         # --- Model picker callbacks ---
         if data.startswith(("mp:", "mpg:", "mm:", "mb", "mx", "mg:")):
             chat_id = str(query.message.chat_id) if query.message else None
@@ -5196,6 +5206,27 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         await self._ensure_forum_commands(update.message)
 
+        try:
+            from gateway.platforms.pulse_ui import (
+                build_pulse_discussion_agent_prompt,
+                handle_pulse_write_in_message,
+                send_pulse_write_in_confirmation,
+            )
+            if handle_pulse_write_in_message(self, msg):
+                await send_pulse_write_in_confirmation(self, msg)
+                return
+            pulse_prompt = build_pulse_discussion_agent_prompt(msg)
+            if pulse_prompt:
+                event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
+                event.text = pulse_prompt
+                event = self._apply_telegram_group_observe_attribution(event)
+                self._enqueue_text_event(event)
+                return
+        except Exception as exc:
+            logger.error("Pulse Telegram discussion failed: %s", exc, exc_info=True)
+            await msg.reply_text("Pulse discussion failed — check gateway logs.")
+            return
+
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
         event = self._apply_telegram_group_observe_attribution(event)
@@ -5209,6 +5240,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if not self._should_process_message(msg, is_command=True):
             return
         await self._ensure_forum_commands(msg)
+
+        cleaned_text = self._clean_bot_trigger_text(msg.text or "") or ""
+        parts = cleaned_text.strip().lower().split()
+        if parts and parts[0].split("@", 1)[0] == "/pulse":
+            try:
+                from gateway.platforms.pulse_ui import handle_pulse_command
+                await handle_pulse_command(self, msg)
+            except Exception as exc:
+                logger.error("Pulse Telegram command failed: %s", exc, exc_info=True)
+                await msg.reply_text("Pulse UI failed — check gateway logs.")
+            return
 
         event = self._build_message_event(msg, MessageType.COMMAND, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
