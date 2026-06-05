@@ -3,7 +3,8 @@
 This module is intentionally small and file-backed. It provides the Pulse
 onboarding/menu UI for the existing Telegram adapter via a `pulse:` callback
 prefix. It does not run the briefing agent; cron jobs remain responsible for
-brief generation and must stay paused until onboarding completes.
+brief generation and can resume once onboarding completes and the user selects
+an activation posture.
 """
 from __future__ import annotations
 
@@ -283,7 +284,10 @@ def _set_selected(profile: dict[str, Any], selected: set[str]) -> None:
 
 def _main_keyboard(profile: dict[str, Any] | None = None) -> InlineKeyboardMarkup:
     profile = profile or {}
-    if profile.get("status") == "onboarding_interview_pending" or profile.get("onboarding", {}).get("interview"):
+    if profile.get("status") == "active":
+        start_data = "pulse:onb:interview"
+        start_label = "🧭 Review/edit interview"
+    elif profile.get("status") == "onboarding_interview_pending" or profile.get("onboarding", {}).get("interview"):
         start_data = "pulse:onb:interview"
         start_label = "🧭 Continue interview"
     else:
@@ -375,6 +379,85 @@ def _answer_label(profile: dict[str, Any], question: dict[str, Any], answer_key:
 
 def _answer_labels(profile: dict[str, Any], question: dict[str, Any]) -> list[str]:
     return [_answer_label(profile, question, key) for key in _answer_values(profile, question["id"])]
+
+
+def _activation_values(profile: dict[str, Any]) -> list[str]:
+    return _answer_values(profile, "final_activation_posture")
+
+
+def _pulse_jobs_for_activation(profile: dict[str, Any]) -> list[str]:
+    values = set(_activation_values(profile))
+    if "activate_all" in values:
+        return ["Pulse Daily", "Pulse Weekly", "Pulse Emergency"]
+    if "activate_daily_weekly" in values:
+        return ["Pulse Daily", "Pulse Weekly"]
+    return []
+
+
+def _resume_pulse_jobs_for_activation(profile: dict[str, Any]) -> dict[str, Any]:
+    requested = _activation_values(profile)
+    job_names = _pulse_jobs_for_activation(profile)
+    result: dict[str, Any] = {"requested": requested, "resumed_jobs": [], "missing_jobs": [], "errors": []}
+    if not job_names:
+        return result
+    try:
+        from cron.jobs import resume_job
+    except Exception as exc:
+        result["errors"].append(f"cron import failed: {exc}")
+        return result
+    for name in job_names:
+        try:
+            job = resume_job(name)
+        except Exception as exc:
+            result["errors"].append(f"{name}: {exc}")
+            continue
+        if job:
+            result["resumed_jobs"].append(job.get("name") or name)
+        else:
+            result["missing_jobs"].append(name)
+    result["at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+def _pause_pulse_jobs(reason: str = "Pulse paused from Telegram UI") -> dict[str, Any]:
+    result: dict[str, Any] = {"paused_jobs": [], "missing_jobs": [], "errors": []}
+    try:
+        from cron.jobs import pause_job
+    except Exception as exc:
+        result["errors"].append(f"cron import failed: {exc}")
+        return result
+    for name in ["Pulse Daily", "Pulse Weekly", "Pulse Emergency"]:
+        try:
+            job = pause_job(name, reason=reason)
+        except Exception as exc:
+            result["errors"].append(f"{name}: {exc}")
+            continue
+        if job:
+            result["paused_jobs"].append(job.get("name") or name)
+        else:
+            result["missing_jobs"].append(name)
+    result["at"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+def _completion_text(profile: dict[str, Any], activation_result: dict[str, Any]) -> str:
+    lines = [_interview_summary(profile), ""]
+    resumed = activation_result.get("resumed_jobs") or []
+    missing = activation_result.get("missing_jobs") or []
+    errors = activation_result.get("errors") or []
+    if resumed:
+        lines.append("Activation: resumed " + ", ".join(resumed) + ".")
+    elif "keep_paused" in set(_activation_values(profile)):
+        lines.append("Activation: Pulse remains paused because you selected keep paused.")
+    elif "review_first" in set(_activation_values(profile)):
+        lines.append("Activation: review summary shown; Pulse remains paused until you explicitly resume it.")
+    else:
+        lines.append("Activation: no Pulse cron jobs were resumed.")
+    if missing:
+        lines.append("Missing Pulse jobs: " + ", ".join(missing) + ".")
+    if errors:
+        lines.append("Activation errors: " + "; ".join(errors))
+    return "\n".join(lines)
 
 
 def _interview_keyboard(profile: dict[str, Any]) -> InlineKeyboardMarkup:
@@ -641,7 +724,7 @@ def _interview_summary(profile: dict[str, Any]) -> str:
             lines.append(f"• {q['text']} {', '.join(labels)}")
     lines.extend([
         "",
-        "I will keep Pulse crons paused until this review is accepted/resumed. Next implementation gate: attach feedback buttons to actual scheduled briefs, then resume the selected cadences.",
+        "Activation follows your final interview answer. You can still change layouts, article counts, interests, or pause Pulse from the menu.",
     ])
     return "\n".join(lines)
 
@@ -1029,16 +1112,25 @@ async def handle_pulse_callback(adapter: Any, query: Any, data: str) -> None:
         if missing:
             await query.answer(f"{len(missing)} unanswered question(s)", show_alert=True)
             return
-        profile["status"] = "onboarding_review_pending"
+        activation_result = _resume_pulse_jobs_for_activation(profile)
+        resumed = bool(activation_result.get("resumed_jobs"))
+        requested = set(_activation_values(profile))
+        profile["status"] = "active" if resumed else "onboarding_review_pending"
         onboarding = profile.setdefault("onboarding", {})
         onboarding["interview_completed_at"] = datetime.now(timezone.utc).isoformat()
-        onboarding["completed"] = False
-        onboarding["required_before_resuming_crons"] = True
-        _note(fb, "interview_complete review_required_before_cron_resume")
+        onboarding["completed"] = resumed
+        if resumed:
+            onboarding["completed_at"] = onboarding.get("completed_at") or datetime.now(timezone.utc).isoformat()
+            onboarding["activated_at"] = datetime.now(timezone.utc).isoformat()
+        onboarding["required_before_resuming_crons"] = not resumed
+        onboarding["activation_result"] = activation_result
+        if "keep_paused" in requested or "review_first" in requested:
+            onboarding["required_before_resuming_crons"] = True
+        _note(fb, f"interview_complete activation={','.join(_activation_values(profile)) or 'none'} resumed={','.join(activation_result.get('resumed_jobs') or [])}")
         _save(PROFILE_PATH, profile)
         _save(FEEDBACK_PATH, fb)
         await query.answer("Interview complete")
-        await edit(_interview_summary(profile), _main_keyboard(profile))
+        await edit(_completion_text(profile, activation_result), _main_keyboard(profile))
         return
 
     if data.startswith("pulse:onb:toggle:"):
@@ -1131,13 +1223,22 @@ async def handle_pulse_callback(adapter: Any, query: Any, data: str) -> None:
         return
 
     if data == "pulse:pause":
+        pause_result = _pause_pulse_jobs()
         profile["status"] = "onboarding_required"
-        profile.setdefault("onboarding", {})["required_before_resuming_crons"] = True
-        _note(fb, "keep_crons_paused")
+        onboarding = profile.setdefault("onboarding", {})
+        onboarding["required_before_resuming_crons"] = True
+        onboarding["completed"] = False
+        onboarding["pause_result"] = pause_result
+        _note(fb, f"keep_crons_paused paused={','.join(pause_result.get('paused_jobs') or [])}")
         _save(PROFILE_PATH, profile)
         _save(FEEDBACK_PATH, fb)
-        await query.answer("Pulse remains paused")
-        await edit("Pulse remains paused until onboarding and interview are complete.", _main_keyboard(profile))
+        await query.answer("Pulse paused")
+        text = "Pulse remains paused."
+        if pause_result.get("paused_jobs"):
+            text += " Paused jobs: " + ", ".join(pause_result["paused_jobs"]) + "."
+        if pause_result.get("errors"):
+            text += " Errors: " + "; ".join(pause_result["errors"])
+        await edit(text, _main_keyboard(profile))
         return
 
     if data.startswith("pulse:item:"):
