@@ -15,6 +15,7 @@ import contextvars
 import json
 import logging
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,6 +60,22 @@ def _pulse_delivery_metadata(job: dict, platform_name: str, content: str) -> Opt
     except Exception:
         logger.debug("Job '%s': could not build Pulse reply markup", job.get("id"), exc_info=True)
         return None
+
+
+def _pulse_delivery_units(job: dict, platform_name: str, content: str) -> list[dict]:
+    """Return text/metadata delivery units for Telegram Pulse briefs."""
+    if str(platform_name).lower() != "telegram":
+        return [{"text": content, "metadata": None}]
+    job_name = str(job.get("name") or "")
+    if not job_name.lower().startswith("pulse "):
+        return [{"text": content, "metadata": None}]
+    try:
+        from gateway.platforms import pulse_ui
+        units = pulse_ui.split_brief_for_delivery(content)
+        return units or [{"text": content, "metadata": pulse_ui.metadata_for_brief(content)}]
+    except Exception:
+        logger.debug("Job '%s': could not split Pulse delivery units", job.get("id"), exc_info=True)
+        return [{"text": content, "metadata": _pulse_delivery_metadata(job, platform_name, content)}]
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -791,11 +808,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
-        send_metadata = {"thread_id": thread_id} if thread_id else {}
-        pulse_metadata = _pulse_delivery_metadata(job, platform_name, cleaned_delivery_content)
-        if pulse_metadata:
-            send_metadata.update(pulse_metadata)
-        send_metadata = send_metadata or None
+        base_metadata = {"thread_id": thread_id} if thread_id else {}
+        delivery_units = _pulse_delivery_units(job, platform_name, cleaned_delivery_content)
+        if not delivery_units:
+            delivery_units = [{"text": cleaned_delivery_content, "metadata": None}]
+
+        def _metadata_for_unit(unit: dict) -> dict | None:
+            merged = dict(base_metadata)
+            unit_metadata = unit.get("metadata")
+            if unit_metadata:
+                merged.update(unit_metadata)
+            return merged or None
 
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
@@ -803,43 +826,45 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
             try:
-                # Send cleaned text (MEDIA tags stripped) — not the raw content
-                text_to_send = cleaned_delivery_content.strip()
                 adapter_ok = True
-                if text_to_send:
-                    from agent.async_utils import safe_schedule_threadsafe
+                from agent.async_utils import safe_schedule_threadsafe
+                for unit in delivery_units:
+                    text_to_send = str(unit.get("text") or "").strip()
+                    if not text_to_send:
+                        continue
                     future = safe_schedule_threadsafe(
-                        runtime_adapter.send(chat_id, text_to_send, metadata=send_metadata),
+                        runtime_adapter.send(chat_id, text_to_send, metadata=_metadata_for_unit(unit)),
                         loop,
                     )
                     if future is None:
                         adapter_ok = False
-                    else:
-                        try:
-                            send_result = future.result(timeout=60)
-                        except TimeoutError:
-                            future.cancel()
-                            raise
-                        if send_result and not getattr(send_result, "success", True):
-                            err = getattr(send_result, "error", "unknown")
-                            logger.warning(
-                                "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
-                                job["id"], platform_name, chat_id, err,
-                            )
-                            adapter_ok = False  # fall through to standalone path
-                        elif (
-                            send_result
-                            and thread_id
-                            and getattr(send_result, "raw_response", None)
-                            and send_result.raw_response.get("thread_fallback")
-                        ):
-                            requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
-                            msg = (
-                                f"configured thread_id {requested_thread_id} for "
-                                f"{platform_name}:{chat_id} was not found; delivered without thread_id"
-                            )
-                            logger.warning("Job '%s': %s", job["id"], msg)
-                            delivery_errors.append(msg)
+                        break
+                    try:
+                        send_result = future.result(timeout=60)
+                    except TimeoutError:
+                        future.cancel()
+                        raise
+                    if send_result and not getattr(send_result, "success", True):
+                        err = getattr(send_result, "error", "unknown")
+                        logger.warning(
+                            "Job '%s': live adapter send to %s:%s failed (%s), falling back to standalone",
+                            job["id"], platform_name, chat_id, err,
+                        )
+                        adapter_ok = False  # fall through to standalone path
+                        break
+                    if (
+                        send_result
+                        and thread_id
+                        and getattr(send_result, "raw_response", None)
+                        and send_result.raw_response.get("thread_fallback")
+                    ):
+                        requested_thread_id = send_result.raw_response.get("requested_thread_id") or thread_id
+                        msg = (
+                            f"configured thread_id {requested_thread_id} for "
+                            f"{platform_name}:{chat_id} was not found; delivered without thread_id"
+                        )
+                        logger.warning("Job '%s': %s", job["id"], msg)
+                        delivery_errors.append(msg)
 
                 # Send extracted media files as native attachments via the live adapter
                 if adapter_ok and media_files:
@@ -847,7 +872,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         runtime_adapter,
                         chat_id,
                         media_files,
-                        send_metadata,
+                        base_metadata or None,
                         loop,
                         job,
                         platform=platform,
@@ -863,32 +888,57 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 )
 
         if not delivered:
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=send_metadata)
             try:
-                result = asyncio.run(coro)
-            except RuntimeError:
-                # asyncio.run() checks for a running loop before awaiting the coroutine;
-                # when it raises, the original coro was never started — close it to
-                # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-                # fresh thread that has no running loop.
-                coro.close()
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=send_metadata))
-                    result = future.result(timeout=30)
+                for index, unit in enumerate(delivery_units):
+                    text_to_send = str(unit.get("text") or "").strip()
+                    if not text_to_send:
+                        continue
+                    unit_media_files = media_files if index == len(delivery_units) - 1 else []
+                    coro = _send_to_platform(
+                        platform,
+                        pconfig,
+                        chat_id,
+                        text_to_send,
+                        thread_id=thread_id,
+                        media_files=unit_media_files,
+                        metadata=_metadata_for_unit(unit),
+                    )
+                    try:
+                        result = asyncio.run(coro)
+                    except RuntimeError:
+                        # asyncio.run() checks for a running loop before awaiting the coroutine;
+                        # when it raises, the original coro was never started — close it to
+                        # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
+                        # fresh thread that has no running loop.
+                        coro.close()
+                        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                            future = pool.submit(
+                                asyncio.run,
+                                _send_to_platform(
+                                    platform,
+                                    pconfig,
+                                    chat_id,
+                                    text_to_send,
+                                    thread_id=thread_id,
+                                    media_files=unit_media_files,
+                                    metadata=_metadata_for_unit(unit),
+                                ),
+                            )
+                            result = future.result(timeout=30)
+
+                    if result and result.get("error"):
+                        msg = f"delivery error: {result['error']}"
+                        logger.error("Job '%s': %s", job["id"], msg)
+                        delivery_errors.append(msg)
+                        break
+                else:
+                    logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+                    continue
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg)
                 delivery_errors.append(msg)
                 continue
-
-            if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
-                logger.error("Job '%s': %s", job["id"], msg)
-                delivery_errors.append(msg)
-                continue
-
-            logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
 
     if delivery_errors:
         return "; ".join(delivery_errors)
@@ -964,7 +1014,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     scripts_dir.mkdir(parents=True, exist_ok=True)
     scripts_dir_resolved = scripts_dir.resolve()
 
-    raw = Path(script_path).expanduser()
+    try:
+        parts = shlex.split(script_path)
+    except ValueError as exc:
+        return False, f"Invalid script command: {exc}"
+    if not parts:
+        return False, "Script path is empty"
+    script_name, script_args = parts[0], parts[1:]
+
+    raw = Path(script_name).expanduser()
     if raw.is_absolute():
         path = raw.resolve()
     else:
@@ -1007,9 +1065,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
             )
-        argv = [_bash, str(path)]
+        argv = [_bash, str(path), *script_args]
     else:
-        argv = [sys.executable, str(path)]
+        argv = [sys.executable, str(path), *script_args]
 
     run_env = os.environ.copy()
     run_env["HERMES_HOME"] = str(_get_hermes_home())

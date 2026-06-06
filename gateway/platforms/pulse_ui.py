@@ -294,9 +294,17 @@ def metadata_for_brief(text: str) -> dict[str, Any] | None:
 
 
 def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
-    """Split a Pulse brief so each item message carries its own buttons."""
+    """Split a Pulse brief so each item message carries its own buttons.
+
+    Telegram inline keyboards are always rendered under the message they are
+    attached to. A single keyboard for a full brief therefore appears grouped at
+    the bottom. For scheduled Pulse briefs, split numbered/bulleted item blocks
+    into separate delivery units so feedback controls appear directly under the
+    relevant item while preserving header/footer text as plain messages.
+    """
     if not text or not text.strip():
         return []
+
     lines = text.splitlines()
     units: list[dict[str, Any]] = []
     plain_buffer: list[str] = []
@@ -332,14 +340,16 @@ def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
             while i < len(lines) and not lines[i].strip():
                 i += 1
             continue
+
         plain_buffer.append(line)
         i += 1
 
     flush_plain()
-    if item_count <= 1:
-        return [{"text": text.strip(), "metadata": metadata_for_brief(text)}]
-    return units
 
+    if item_count <= 1:
+        metadata = metadata_for_brief(text)
+        return [{"text": text.strip(), "metadata": metadata}]
+    return units
 
 def _load_recent_item(item_id: str) -> dict[str, Any]:
     try:

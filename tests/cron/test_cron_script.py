@@ -109,6 +109,23 @@ class TestRunJobScript:
         assert success is True
         assert output == "relative works"
 
+    def test_script_relative_path_with_arguments(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "args.py"
+        script.write_text('import sys; print("|".join(sys.argv[1:]))\n')
+
+        success, output = _run_job_script('args.py --mode daily "two words"')
+        assert success is True
+        assert output == "--mode|daily|two words"
+
+    def test_script_arguments_do_not_bypass_path_containment(self, cron_env):
+        from cron.scheduler import _run_job_script
+
+        success, output = _run_job_script("../../etc/passwd --mode daily")
+        assert success is False
+        assert "outside the scripts directory" in output
+
     def test_script_not_found(self, cron_env):
         from cron.scheduler import _run_job_script
 

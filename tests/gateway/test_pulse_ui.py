@@ -78,6 +78,29 @@ class TestPulseUi:
 
         assert ids == ["P00000001", "P00000002", "P00000003"]
 
+    def test_split_brief_for_delivery_attaches_buttons_per_item(self):
+        units = pulse_ui.split_brief_for_delivery(
+            "Pulse Daily\n\n"
+            "1) First item. ID: P05E8F791\n\n"
+            "2) Second item. IDs: P00969B9E / P00000003\n\n"
+            "Feedback: reply with IDs if buttons are unavailable."
+        )
+
+        assert [unit["text"].splitlines()[0] for unit in units] == [
+            "Pulse Daily",
+            "1) First item. ID: P05E8F791",
+            "2) Second item. IDs: P00969B9E / P00000003",
+            "Feedback: reply with IDs if buttons are unavailable.",
+        ]
+        assert units[0]["metadata"] is None
+        assert units[1]["metadata"]["reply_markup"]["inline_keyboard"][0][0]["callback_data"] == "pulse:up:P05E8F791"
+        second_rows = units[2]["metadata"]["reply_markup"]["inline_keyboard"]
+        assert [row[0]["callback_data"] for row in second_rows] == [
+            "pulse:up:P00969B9E",
+            "pulse:up:P00000003",
+        ]
+        assert units[3]["metadata"] is None
+
 
 class TestTelegramPulseMarkup:
     @pytest.mark.asyncio
