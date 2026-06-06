@@ -46,6 +46,21 @@ from hermes_time import now as _hermes_now
 logger = logging.getLogger(__name__)
 
 
+def _pulse_delivery_metadata(job: dict, platform_name: str, content: str) -> Optional[dict]:
+    """Return Telegram inline-button metadata for scheduled Pulse briefs."""
+    if str(platform_name).lower() != "telegram":
+        return None
+    job_name = str(job.get("name") or "")
+    if not job_name.lower().startswith("pulse "):
+        return None
+    try:
+        from gateway.platforms import pulse_ui
+        return pulse_ui.metadata_for_brief(content)
+    except Exception:
+        logger.debug("Job '%s': could not build Pulse reply markup", job.get("id"), exc_info=True)
+        return None
+
+
 class CronPromptInjectionBlocked(Exception):
     """Raised by _build_job_prompt when the fully-assembled prompt trips the
     injection scanner. Caught in run_job so the operator sees a clean
@@ -776,12 +791,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        send_metadata = {"thread_id": thread_id} if thread_id else {}
+        pulse_metadata = _pulse_delivery_metadata(job, platform_name, cleaned_delivery_content)
+        if pulse_metadata:
+            send_metadata.update(pulse_metadata)
+        send_metadata = send_metadata or None
+
         # Prefer the live adapter when the gateway is running — this supports E2EE
         # rooms (e.g. Matrix) where the standalone HTTP path cannot encrypt.
         runtime_adapter = (adapters or {}).get(platform)
         delivered = False
         if runtime_adapter is not None and loop is not None and getattr(loop, "is_running", lambda: False)():
-            send_metadata = {"thread_id": thread_id} if thread_id else None
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content
                 text_to_send = cleaned_delivery_content.strip()
@@ -844,7 +864,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
 
         if not delivered:
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=send_metadata)
             try:
                 result = asyncio.run(coro)
             except RuntimeError:
@@ -854,7 +874,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # fresh thread that has no running loop.
                 coro.close()
                 with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
+                    future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files, metadata=send_metadata))
                     result = future.result(timeout=30)
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"

@@ -9,15 +9,25 @@ an activation posture.
 from __future__ import annotations
 
 import json
+import logging
+import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+logger = logging.getLogger(__name__)
+
 PULSE_DIR = Path.home() / ".hermes" / "pulse"
 PROFILE_PATH = PULSE_DIR / "profile.json"
 FEEDBACK_PATH = PULSE_DIR / "feedback.json"
+STATE_PATH = PULSE_DIR / "state.json"
+SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "pulse_feedback.py"
+PULSE_ITEM_RE = re.compile(r"\b(P[0-9A-Fa-f]{8})\b")
+PULSE_ITEM_LINE_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-*])\s+.*\bP[0-9A-Fa-f]{8}\b")
+MAX_ITEMS_WITH_BUTTONS = 20
 
 INTERESTS = [
     ("ai_models", "AI/frontier models"),
@@ -242,6 +252,157 @@ CATEGORY_INTERVIEW_QUESTIONS = {
     },
 }
 
+
+
+def extract_item_ids(text: str, *, limit: int = MAX_ITEMS_WITH_BUTTONS) -> list[str]:
+    """Return unique Pulse item IDs in encounter order."""
+    seen: set[str] = set()
+    result: list[str] = []
+    for match in PULSE_ITEM_RE.finditer(text or ""):
+        item_id = match.group(1).upper()
+        if item_id in seen:
+            continue
+        seen.add(item_id)
+        result.append(item_id)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def build_reply_markup_spec(text: str, *, item_ids: list[str] | None = None) -> dict[str, Any] | None:
+    """Build a JSON-serializable Telegram inline-keyboard spec for a brief."""
+    item_ids = item_ids if item_ids is not None else extract_item_ids(text)
+    if not item_ids:
+        return None
+    rows: list[list[dict[str, str]]] = []
+    for item_id in item_ids:
+        rows.append([
+            {"text": f"👍 {item_id}", "callback_data": f"pulse:up:{item_id}"},
+            {"text": "👎", "callback_data": f"pulse:down:{item_id}"},
+            {"text": "Hide", "callback_data": f"pulse:mute:{item_id}"},
+            {"text": "Explain", "callback_data": f"pulse:explain:{item_id}"},
+        ])
+    return {"inline_keyboard": rows}
+
+
+def metadata_for_brief(text: str) -> dict[str, Any] | None:
+    """Return gateway metadata for Pulse brief buttons, or None."""
+    markup = build_reply_markup_spec(text)
+    if not markup:
+        return None
+    return {"reply_markup": markup}
+
+
+def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
+    """Split a Pulse brief so each item message carries its own buttons."""
+    if not text or not text.strip():
+        return []
+    lines = text.splitlines()
+    units: list[dict[str, Any]] = []
+    plain_buffer: list[str] = []
+    item_count = 0
+    i = 0
+
+    def flush_plain() -> None:
+        nonlocal plain_buffer
+        block = "\n".join(plain_buffer).strip()
+        if block:
+            units.append({"text": block, "metadata": None})
+        plain_buffer = []
+
+    while i < len(lines):
+        line = lines[i]
+        if PULSE_ITEM_LINE_RE.search(line):
+            flush_plain()
+            block_lines = [line]
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                if PULSE_ITEM_LINE_RE.search(lines[i]):
+                    break
+                block_lines.append(lines[i])
+                i += 1
+            block = "\n".join(block_lines).strip()
+            ids = extract_item_ids(block)
+            metadata = None
+            if ids:
+                markup = build_reply_markup_spec(block, item_ids=ids)
+                metadata = {"reply_markup": markup} if markup else None
+                item_count += 1
+            units.append({"text": block, "metadata": metadata})
+            while i < len(lines) and not lines[i].strip():
+                i += 1
+            continue
+        plain_buffer.append(line)
+        i += 1
+
+    flush_plain()
+    if item_count <= 1:
+        return [{"text": text.strip(), "metadata": metadata_for_brief(text)}]
+    return units
+
+
+def _load_recent_item(item_id: str) -> dict[str, Any]:
+    try:
+        state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    for key in ("recent_items", "items", "item_by_id"):
+        value = state.get(key)
+        if isinstance(value, dict) and isinstance(value.get(item_id), dict):
+            return value[item_id]
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict) and str(item.get("id") or item.get("item_id")).upper() == item_id:
+                    return item
+    return {}
+
+
+def _format_explain_followup(item_id: str) -> str:
+    item = _load_recent_item(item_id)
+    if not item:
+        return f"Pulse item {item_id}: I could not find recent local item context. Reply `Pulse explain {item_id}` if you want me to investigate it live."
+    title = item.get("title") or item.get("headline") or "Untitled item"
+    source = item.get("source") or item.get("source_id") or "unknown source"
+    url = item.get("url") or ""
+    topics = item.get("topics") or []
+    topics_text = ", ".join(topics) if isinstance(topics, list) else str(topics)
+    return "\n".join(part for part in [
+        f"Pulse item {item_id}",
+        f"Title: {title}",
+        f"Source: {source}",
+        f"Topics: {topics_text}" if topics_text else "",
+        f"URL: {url}" if url else "",
+    ] if part)
+
+
+async def dispatch_callback(data: str) -> tuple[bool, str, str | None]:
+    """Handle scheduled-brief feedback callbacks like pulse:up:PABC12345."""
+    parts = (data or "").split(":", 2)
+    if len(parts) != 3 or parts[0] != "pulse":
+        return False, "Bad Pulse action.", None
+    action, item_id = parts[1], parts[2].upper()
+    if action not in {"up", "down", "mute", "explain"} or not PULSE_ITEM_RE.fullmatch(item_id):
+        return False, "Bad Pulse action.", None
+    if action == "explain":
+        return True, "Opened item context.", _format_explain_followup(item_id)
+    command_action = "mute" if action == "mute" else action
+    try:
+        proc = subprocess.run(
+            ["python3", str(SCRIPT_PATH), "Pulse", command_action, item_id, "telegram button"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        logger.warning("Pulse feedback callback failed for %s %s: %s", action, item_id, exc)
+        return False, "Pulse feedback failed.", None
+    if proc.returncode != 0:
+        logger.warning("Pulse feedback command failed rc=%s stderr=%s", proc.returncode, proc.stderr[-500:])
+        return False, "Pulse feedback failed.", None
+    label = {"up": "Saved thumbs up", "down": "Saved thumbs down", "mute": "Hidden"}.get(action, "Saved")
+    return True, f"{label}: {item_id}", None
 
 def _load(path: Path, default: Any) -> Any:
     try:
@@ -803,6 +964,15 @@ async def handle_pulse_command(adapter: Any, msg: Any) -> None:
 
 
 async def handle_pulse_callback(adapter: Any, query: Any, data: str) -> None:
+    if re.fullmatch(r"pulse:(?:up|down|mute|explain):P[0-9A-Fa-f]{8}", data or ""):
+        success, toast, followup = await dispatch_callback(data)
+        await query.answer(text=toast)
+        if success and followup:
+            chat_id = getattr(getattr(query, "message", None), "chat_id", None)
+            if chat_id is not None:
+                await adapter.send(str(chat_id), followup)
+        return
+
     profile = _profile()
     fb = _feedback()
 

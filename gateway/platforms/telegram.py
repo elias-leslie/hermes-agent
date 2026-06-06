@@ -507,6 +507,46 @@ class TelegramAdapter(BasePlatformAdapter):
             return {}
         return {"disable_notification": True}
 
+    def _reply_markup_from_metadata(
+        self, metadata: Optional[Dict[str, Any]]
+    ) -> Any:
+        """Return Telegram reply_markup supplied by trusted gateway metadata."""
+        if not metadata:
+            return None
+        raw_markup = metadata.get("reply_markup") or metadata.get("telegram_reply_markup")
+        if not raw_markup:
+            return None
+        if hasattr(raw_markup, "inline_keyboard"):
+            return raw_markup
+        keyboard = None
+        if isinstance(raw_markup, dict):
+            keyboard = raw_markup.get("inline_keyboard")
+        elif isinstance(raw_markup, list):
+            keyboard = raw_markup
+        if not isinstance(keyboard, list):
+            logger.warning("[%s] Ignoring invalid Telegram reply_markup metadata", self.name)
+            return None
+        rows = []
+        for row in keyboard:
+            if not isinstance(row, list):
+                continue
+            buttons = []
+            for button in row:
+                if not isinstance(button, dict):
+                    continue
+                text = str(button.get("text") or "").strip()
+                callback_data = button.get("callback_data")
+                url = button.get("url")
+                if not text:
+                    continue
+                if callback_data is not None:
+                    buttons.append(InlineKeyboardButton(text, callback_data=str(callback_data)))  # type: ignore[operator]
+                elif url is not None:
+                    buttons.append(InlineKeyboardButton(text, url=str(url)))  # type: ignore[operator]
+            if buttons:
+                rows.append(buttons)
+        return InlineKeyboardMarkup(rows) if rows else None  # type: ignore[operator]
+
     def _is_callback_user_authorized(
         self,
         user_id: str,
@@ -1894,6 +1934,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except (ImportError, AttributeError):
                 _TimedOut = None  # type: ignore[assignment,misc]
 
+            reply_markup = self._reply_markup_from_metadata(metadata)
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
@@ -1937,6 +1978,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     thread_kwargs["message_thread_id"] = None
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
+                reply_markup_kwargs = {"reply_markup": reply_markup} if reply_markup is not None and i == len(chunks) - 1 else {}
                 msg = None
                 for _send_attempt in range(3):
                     try:
@@ -1950,6 +1992,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **reply_markup_kwargs,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -1964,6 +2007,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **reply_markup_kwargs,
                                 )
                             else:
                                 raise
@@ -3547,6 +3591,30 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- Pulse briefing callbacks (pulse:action:item_id) ---
+        if data.startswith("pulse:"):
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to answer Pulse prompts.")
+                return
+            try:
+                from gateway.platforms import pulse_ui
+                success, toast, followup = await pulse_ui.dispatch_callback(data)
+            except Exception as exc:
+                logger.error("[%s] Pulse callback failed: %s", self.name, exc, exc_info=True)
+                success, toast, followup = False, "Pulse action failed.", None
+            await query.answer(text=toast)
+            if success and followup and query_chat_id is not None:
+                metadata = {"thread_id": str(query_thread_id)} if query_thread_id is not None else None
+                await self.send(str(query_chat_id), followup, metadata=metadata)
             return
 
         # --- Update prompt callbacks ---
