@@ -27,6 +27,8 @@ STATE_PATH = PULSE_DIR / "state.json"
 SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "pulse_feedback.py"
 PULSE_ITEM_RE = re.compile(r"\b(P[0-9A-Fa-f]{8})\b")
 PULSE_ITEM_LINE_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-*])\s+.*\bP[0-9A-Fa-f]{8}\b")
+PULSE_SECTION_HEADING_RE = re.compile(r"^\s*#{2,3}\s+\S")
+PULSE_HORIZONTAL_RULE_RE = re.compile(r"^\s*-{3,}\s*$")
 MAX_ITEMS_WITH_BUTTONS = 20
 
 INTERESTS = [
@@ -293,14 +295,55 @@ def metadata_for_brief(text: str) -> dict[str, Any] | None:
     return {"reply_markup": markup}
 
 
+def _metadata_for_item_block(block: str) -> dict[str, Any] | None:
+    ids = extract_item_ids(block)
+    if not ids:
+        return None
+    markup = build_reply_markup_spec(block, item_ids=ids)
+    return {"reply_markup": markup} if markup else None
+
+
+def _split_heading_sections_for_delivery(text: str) -> list[dict[str, Any]]:
+    """Split markdown section reports so section feedback stays local."""
+    lines = text.splitlines()
+    units: list[dict[str, Any]] = []
+    buffer: list[str] = []
+    saw_section_with_ids = False
+
+    def flush() -> None:
+        nonlocal buffer, saw_section_with_ids
+        block = "\n".join(buffer).strip()
+        buffer = []
+        if not block:
+            return
+        metadata = _metadata_for_item_block(block)
+        if metadata:
+            saw_section_with_ids = True
+        units.append({"text": block, "metadata": metadata})
+
+    for line in lines:
+        if PULSE_HORIZONTAL_RULE_RE.match(line):
+            flush()
+            continue
+        if PULSE_SECTION_HEADING_RE.match(line) and buffer:
+            flush()
+        buffer.append(line)
+    flush()
+
+    if not saw_section_with_ids:
+        return []
+    return units
+
+
 def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
     """Split a Pulse brief so each item message carries its own buttons.
 
     Telegram inline keyboards are always rendered under the message they are
     attached to. A single keyboard for a full brief therefore appears grouped at
     the bottom. For scheduled Pulse briefs, split numbered/bulleted item blocks
-    into separate delivery units so feedback controls appear directly under the
-    relevant item while preserving header/footer text as plain messages.
+    or markdown synthesis sections into separate delivery units so feedback
+    controls appear directly under the relevant item/section while preserving
+    header/footer text as plain messages.
     """
     if not text or not text.strip():
         return []
@@ -330,11 +373,8 @@ def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
                 block_lines.append(lines[i])
                 i += 1
             block = "\n".join(block_lines).strip()
-            ids = extract_item_ids(block)
-            metadata = None
-            if ids:
-                markup = build_reply_markup_spec(block, item_ids=ids)
-                metadata = {"reply_markup": markup} if markup else None
+            metadata = _metadata_for_item_block(block)
+            if metadata:
                 item_count += 1
             units.append({"text": block, "metadata": metadata})
             while i < len(lines) and not lines[i].strip():
@@ -346,10 +386,15 @@ def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
 
     flush_plain()
 
-    if item_count <= 1:
-        metadata = metadata_for_brief(text)
-        return [{"text": text.strip(), "metadata": metadata}]
-    return units
+    if item_count > 1:
+        return units
+
+    section_units = _split_heading_sections_for_delivery(text)
+    if len([unit for unit in section_units if unit.get("metadata")]) > 1:
+        return section_units
+
+    metadata = metadata_for_brief(text)
+    return [{"text": text.strip(), "metadata": metadata}]
 
 def _load_recent_item(item_id: str) -> dict[str, Any]:
     try:
