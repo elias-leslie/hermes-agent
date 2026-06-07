@@ -1378,6 +1378,59 @@ def _scan_assembled_cron_prompt(assembled: str, job: dict, *, has_skills: bool =
     return assembled
 
 
+def _job_requests_pulse_usage_line(job: dict) -> bool:
+    """Return whether this cron job should append a user-visible usage line."""
+    name = str(job.get("name") or "").strip().lower()
+    if name.startswith("pulse"):
+        return True
+
+    skills = job.get("skills")
+    if skills is None:
+        skills = [job.get("skill")] if job.get("skill") else []
+    elif isinstance(skills, str):
+        skills = [skills]
+    return any(str(skill).strip() == "pulse-briefing-routine" for skill in skills if skill)
+
+
+def _format_cron_usage_line(result: dict) -> str:
+    """Format token/cost metadata from AIAgent.run_conversation for delivery."""
+    total = int(result.get("total_tokens") or 0)
+    input_tokens = int(result.get("input_tokens") or result.get("prompt_tokens") or 0)
+    output_tokens = int(result.get("output_tokens") or result.get("completion_tokens") or 0)
+    cache_read = int(result.get("cache_read_tokens") or 0)
+    cache_write = int(result.get("cache_write_tokens") or 0)
+    reasoning = int(result.get("reasoning_tokens") or 0)
+    api_calls = int(result.get("api_calls") or 0)
+
+    status = str(result.get("cost_status") or "unknown").strip().lower()
+    amount = result.get("estimated_cost_usd")
+    if amount is not None:
+        prefix = "~" if status == "estimated" else ""
+        cost = f"{prefix}${float(amount):.4f}"
+    elif status == "included":
+        cost = "included"
+    else:
+        cost = "n/a"
+
+    return (
+        "Usage: "
+        f"{total:,} tokens "
+        f"(in {input_tokens:,}, out {output_tokens:,}, "
+        f"cache read {cache_read:,}, cache write {cache_write:,}, "
+        f"reasoning {reasoning:,}; API calls {api_calls}; cost {cost})"
+    )
+
+
+def _append_cron_usage_line_if_requested(job: dict, final_response: str, result: dict) -> str:
+    """Append Pulse briefing token/cost metadata without touching silent/empty runs."""
+    if not final_response.strip() or not _job_requests_pulse_usage_line(job):
+        return final_response
+    usage_line = _format_cron_usage_line(result)
+    if usage_line in final_response:
+        return final_response
+    return f"{final_response.rstrip()}\n\n{usage_line}"
+
+
 def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job, applying any per-job profile override."""
     job_id = job["id"]
@@ -1952,6 +2005,7 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+        final_response = _append_cron_usage_line_if_requested(job, final_response, result)
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
