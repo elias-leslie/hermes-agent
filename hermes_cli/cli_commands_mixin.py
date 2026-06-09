@@ -447,6 +447,212 @@ class CLICommandsMixin:
         print(f"  Home:    {display}")
         print()
 
+    def _handle_mem_command(self, cmd_original: str) -> None:
+        """Handle ``/mem ...`` — bridge to the active Agent Hub memory provider.
+
+        Subcommands:
+          /mem                Show recap (recent + continuity)
+          /mem recap          Same as bare /mem
+          /mem search <q>     Vector search via agent_hub_search
+          /mem save <content> Save a learning via agent_hub_save_learning
+          /mem rate <uuid> <helpful|harmful|used>
+                               Rate a memory by UUID
+          /mem help           Show usage
+
+        The handler is a thin CLI wrapper around the agent_hub plugin's
+        tool calls. If the plugin is not active, it falls back to a
+        "not connected" message — no crash, no state mutation.
+        """
+        # Strip the leading "/mem" and any leading whitespace, then split.
+        # cmd_original includes the leading "/mem" — strip it conservatively.
+        body = cmd_original.split(None, 1)
+        body = body[1] if len(body) > 1 else ""
+        body = body.strip()
+        sub = body.split(None, 1)
+        action = sub[0].lower() if sub else ""
+        rest = sub[1] if len(sub) > 1 else ""
+
+        # Lazy-load the plugin loader — heavy import path, only needed
+        # when the user actually invokes /mem.
+        from plugins.memory import load_memory_provider
+
+        # ``help`` is a pure-text subcommand — short-circuit before
+        # checking provider availability so users can always see usage
+        # even when the bridge isn't active.
+        if action == "help":
+            self._print_mem_help()
+            return
+
+        provider = load_memory_provider("agent_hub")
+        if not provider or not provider.is_available():
+            print()
+            print("  Agent Hub memory bridge not active.")
+            print("  Enable it:  hermes config set memory.provider agent_hub")
+            print("  (the agent_hub plugin must also be installed under ~/.hermes/plugins/agent_hub/)")
+            print()
+            return
+
+        # Ensure the provider is initialized so tool calls work.
+        # Most plugin instances need initialize() before handle_tool_call();
+        # call it defensively if it hasn't been called yet.
+        if not getattr(provider, "_client", None):
+            from hermes_cli.profiles import get_active_profile_name
+            try:
+                provider.initialize(
+                    session_id=getattr(self.agent, "session_id", "") or "cli-mem",
+                    platform="cli",
+                    agent_identity=get_active_profile_name() or "default",
+                )
+            except Exception as exc:
+                print(f"  Agent Hub bridge init failed: {exc}")
+                return
+
+        import json as _json
+        print()
+        if action in ("", "recap"):
+            result = provider.handle_tool_call("agent_hub_recap", {"max_sessions": 3})
+            try:
+                data = _json.loads(result)
+            except Exception:
+                print(f"  raw: {result[:400]}")
+                print()
+                return
+            print(f"  Agent Hub memory bridge (scope_id={data.get('scope_id', '?')})")
+            recent = data.get("recent") or []
+            continuity = data.get("continuity") or {}
+            if recent:
+                print("  Recent:")
+                for ep in recent[:5]:
+                    name = (ep.get("name") or "(untitled)")[:50]
+                    tier = (ep.get("tier") or "?").upper()
+                    content = (ep.get("content") or "").strip()
+                    preview = (content[:120] + "...") if len(content) > 120 else content
+                    print(f"    [{tier}] {name}")
+                    if preview:
+                        print(f"        {preview}")
+            else:
+                print("  No recent memories in this scope.")
+            if isinstance(continuity, dict) and continuity.get("markdown"):
+                md = continuity["markdown"]
+                # Trim long markdown for terminal readability
+                lines = md.splitlines()[:8]
+                print("  Continuity:")
+                for ln in lines:
+                    print(f"    {ln}")
+                if len(md.splitlines()) > 8:
+                    print(f"    ... ({len(md.splitlines()) - 8} more lines)")
+            print()
+
+        elif action == "search":
+            if not rest:
+                print("  Usage: /mem search <query>")
+                print()
+                return
+            result = provider.handle_tool_call(
+                "agent_hub_search", {"query": rest, "limit": 5}
+            )
+            try:
+                data = _json.loads(result)
+            except Exception:
+                print(f"  raw: {result[:400]}")
+                print()
+                return
+            results = data.get("results") or []
+            print(f"  Search: {rest!r} ({data.get('count', 0)} hit(s))")
+            for i, r in enumerate(results, 1):
+                name = (r.get("name") or "(untitled)")[:50]
+                tier = (r.get("tier") or "?").upper()
+                score = r.get("score")
+                score_str = f" score={score:.3f}" if isinstance(score, (int, float)) else ""
+                content = (r.get("content") or "").strip()
+                preview = (content[:200] + "...") if len(content) > 200 else content
+                print(f"    {i}. [{tier}] {name}{score_str}")
+                print(f"       uuid: {r.get('uuid')}")
+                if preview:
+                    print(f"       {preview}")
+                helpful = r.get("helpful_count", 0)
+                harmful = r.get("harmful_count", 0)
+                if helpful or harmful:
+                    print(f"       feedback: +{helpful} helpful / -{harmful} harmful")
+            print()
+
+        elif action == "save":
+            if not rest:
+                print("  Usage: /mem save <content>")
+                print("  (summary auto-derived from first line)")
+                print()
+                return
+            summary = rest.splitlines()[0].strip()[:200]
+            result = provider.handle_tool_call(
+                "agent_hub_save_learning",
+                {"content": rest, "summary": summary, "tier": "reference"},
+            )
+            try:
+                data = _json.loads(result)
+            except Exception:
+                print(f"  raw: {result[:400]}")
+                print()
+                return
+            if "uuid" in data:
+                print(f"  Saved: uuid={data['uuid']}")
+                if data.get("is_duplicate"):
+                    print(f"  (reinforced duplicate, status={data.get('status')})")
+                else:
+                    print(f"  status={data.get('status')}")
+            else:
+                print(f"  Save failed: {data.get('error', 'unknown error')}")
+            print()
+
+        elif action == "rate":
+            parts = rest.split(None, 1)
+            if len(parts) != 2 or parts[1] not in ("helpful", "harmful", "used"):
+                print("  Usage: /mem rate <uuid> <helpful|harmful|used>")
+                print()
+                return
+            uuid, rating = parts
+            result = provider.handle_tool_call(
+                "agent_hub_rate", {"uuid": uuid, "rating": rating}
+            )
+            try:
+                data = _json.loads(result)
+            except Exception:
+                print(f"  raw: {result[:400]}")
+                print()
+                return
+            if "error" in data:
+                print(f"  Rate failed: {data['error']}")
+            else:
+                print(f"  Rated uuid={uuid} as {rating}.")
+                if "helpful_count" in data:
+                    print(f"  helpful={data.get('helpful_count')} harmful={data.get('harmful_count')}")
+            print()
+
+        elif action == "help":
+            self._print_mem_help()
+        else:
+            print()
+            print(f"  Unknown subcommand: {action!r}. Try /mem help")
+            print()
+
+    def _print_mem_help(self) -> None:
+        """Print /mem usage. Split out so ``help`` works even when the
+        provider is not active — useful when the user is trying to
+        figure out why the bridge isn't connecting."""
+        print()
+        print("  /mem — bridge to Agent Hub memory store")
+        print()
+        print("  Subcommands:")
+        print("    /mem                       Recap (recent memories + continuity)")
+        print("    /mem search <query>        Vector search over Agent Hub memory")
+        print("    /mem save <content>        Save a learning (auto-formatted)")
+        print("    /mem rate <uuid> <rating>  Rate a recalled memory")
+        print("                               rating: helpful | harmful | used")
+        print("    /mem help                  This help")
+        print()
+        print("  All writes auto-format to Agent Hub's **Topic**: imperative standard.")
+        print("  Set hermes config set memory.provider agent_hub to activate.")
+        print()
+
     def _handle_handoff_command(self, cmd_original: str) -> bool:
         """Handle ``/handoff <platform>`` — transfer this CLI session to a gateway platform.
 
