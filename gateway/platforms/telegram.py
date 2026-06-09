@@ -620,6 +620,50 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to = metadata.get("telegram_reply_to_message_id")
         return int(reply_to) if reply_to is not None else None
 
+    @classmethod
+    def _metadata_reply_markup(
+        cls, metadata: Optional[Dict[str, Any]]
+    ) -> Any:
+        """Build an ``InlineKeyboardMarkup`` from ``metadata["reply_markup"]``.
+
+        Callers (Pulse briefs, prompt buttons) hand us a dict shaped like::
+
+            {"inline_keyboard": [[{"text": "...", "callback_data": "..."}, ...]]}
+
+        We translate to the real ``InlineKeyboardButton``/``InlineKeyboardMarkup``
+        types so the bot's ``send_message`` accepts ``reply_markup=`` directly.
+        Returns ``None`` when no markup is requested or the shape is bad —
+        the calling ``send`` path treats ``None`` as "no buttons".
+        """
+        if not metadata:
+            return None
+        spec = metadata.get("reply_markup")
+        if not isinstance(spec, dict):
+            return None
+        rows = spec.get("inline_keyboard")
+        if not isinstance(rows, list):
+            return None
+        built_rows: list[list[Any]] = []
+        for row in rows:
+            if not isinstance(row, list):
+                continue
+            built_row: list[Any] = []
+            for btn in row:
+                if not isinstance(btn, dict):
+                    continue
+                text = btn.get("text", "")
+                kwargs: Dict[str, Any] = {}
+                if btn.get("callback_data") is not None:
+                    kwargs["callback_data"] = btn["callback_data"]
+                if btn.get("url") is not None:
+                    kwargs["url"] = btn["url"]
+                built_row.append(InlineKeyboardButton(text, **kwargs))
+            if built_row:
+                built_rows.append(built_row)
+        if not built_rows:
+            return None
+        return InlineKeyboardMarkup(built_rows)
+
     @staticmethod
     def _looks_like_private_chat_id(chat_id: str) -> bool:
         try:
@@ -1938,6 +1982,7 @@ class TelegramAdapter(BasePlatformAdapter):
             for i, chunk in enumerate(chunks):
                 retried_thread_not_found = False
                 metadata_reply_to = self._metadata_reply_to_message_id(metadata)
+                reply_markup = self._metadata_reply_markup(metadata)
                 private_dm_topic_send = self._is_private_dm_topic_send(chat_id, thread_id, metadata)
                 # reply_to_mode="off" on the existing telegram_dm_topic_reply_fallback path
                 # is an explicit user opt-in to "message_thread_id alone is enough" (PR #23994
@@ -1989,6 +2034,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 text=chunk,
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
+                                **({"reply_markup": reply_markup} if reply_markup is not None else {}),
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
@@ -2004,6 +2050,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     text=plain_chunk,
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
+                                    **({"reply_markup": reply_markup} if reply_markup is not None else {}),
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),

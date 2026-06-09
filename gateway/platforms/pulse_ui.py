@@ -26,10 +26,26 @@ FEEDBACK_PATH = PULSE_DIR / "feedback.json"
 STATE_PATH = PULSE_DIR / "state.json"
 SCRIPT_PATH = Path.home() / ".hermes" / "scripts" / "pulse_feedback.py"
 PULSE_ITEM_RE = re.compile(r"\b(P[0-9A-Fa-f]{8})\b")
+# Line that contains a Pulse item ID anywhere on it. Used to detect per-item
+# delivery units even when the agent wrote `**PID** (Source) — ...` or
+# `• PID text` or any other inline shape. This is the shape most agent briefs
+# actually use, and the prior list-marker-only regex missed it.
+PULSE_ID_LINE_RE = re.compile(r"\bP[0-9A-Fa-f]{8}\b")
+# Backwards-compatible strict shape: numbered/bulleted line that also contains
+# an item ID. Kept for tests; the new splitter prefers PULSE_ID_LINE_RE.
 PULSE_ITEM_LINE_RE = re.compile(r"^\s*(?:\d{1,2}[.)]|[-*])\s+.*\bP[0-9A-Fa-f]{8}\b")
 PULSE_SECTION_HEADING_RE = re.compile(r"^\s*#{2,3}\s+\S")
 PULSE_HORIZONTAL_RULE_RE = re.compile(r"^\s*-{3,}\s*$")
+# `**Header**` or `### header` followed by a body and a `IDs:` line — the
+# market-mode and weekly-synthesis shape the agent uses for thematic blocks.
+PULSE_IDS_LINE_RE = re.compile(r"^\s*IDs?\s*:\s*.*\bP[0-9A-Fa-f]{8}\b", re.IGNORECASE)
+# Bold header line (e.g. `**🌍 Geopolitics & markets**`). Used to start a new
+# themed block in market-mode briefs.
+PULSE_BOLD_HEADER_RE = re.compile(r"^\s*\*\*[^*\n]{2,}\*\*\s*$")
 MAX_ITEMS_WITH_BUTTONS = 20
+# When splitting inline-ID items, attach up to this many context lines AFTER
+# the ID line to keep the item readable in its own Telegram message.
+MAX_ITEM_CONTEXT_LINES = 4
 
 INTERESTS = [
     ("ai_models", "AI/frontier models"),
@@ -304,7 +320,23 @@ def _metadata_for_item_block(block: str) -> dict[str, Any] | None:
 
 
 def _split_heading_sections_for_delivery(text: str) -> list[dict[str, Any]]:
-    """Split markdown section reports so section feedback stays local."""
+    """Split markdown section reports so section feedback stays local.
+
+    Splits on three boundaries, in priority order:
+
+    - horizontal rules ``---`` (the canonical weekly/market block separator)
+    - ``##``/``###`` markdown headings
+    - bold header lines ``**Title**`` (the market-mode thematic header shape)
+
+    A horizontal rule is dropped from the output (it is a separator, not
+    content). A ``##``/``###`` heading or a bold header is **included** in
+    the next section's buffer so the section title lands at the top of
+    the unit and the user sees the full themed block.
+
+    Each section that contains Pulse IDs gets its own delivery unit with
+    an inline keyboard listing the IDs in that section. Sections without
+    IDs (intro, position snapshot, footer) render as plain messages.
+    """
     lines = text.splitlines()
     units: list[dict[str, Any]] = []
     buffer: list[str] = []
@@ -321,12 +353,27 @@ def _split_heading_sections_for_delivery(text: str) -> list[dict[str, Any]]:
             saw_section_with_ids = True
         units.append({"text": block, "metadata": metadata})
 
+    def is_section_title(line: str) -> bool:
+        """Boundary lines that are also section titles — keep them in the
+        next section's buffer instead of dropping them."""
+        if PULSE_SECTION_HEADING_RE.match(line):
+            return True
+        if PULSE_BOLD_HEADER_RE.match(line):
+            return True
+        return False
+
     for line in lines:
         if PULSE_HORIZONTAL_RULE_RE.match(line):
-            flush()
+            # Horizontal rule: flush, then drop the rule.
+            if buffer:
+                flush()
             continue
-        if PULSE_SECTION_HEADING_RE.match(line) and buffer:
+        if is_section_title(line) and buffer:
+            # Section title: flush the previous buffer, then start the
+            # next section WITH this title line as the first line.
             flush()
+            buffer.append(line)
+            continue
         buffer.append(line)
     flush()
 
@@ -340,14 +387,59 @@ def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
 
     Telegram inline keyboards are always rendered under the message they are
     attached to. A single keyboard for a full brief therefore appears grouped at
-    the bottom. For scheduled Pulse briefs, split numbered/bulleted item blocks
-    or markdown synthesis sections into separate delivery units so feedback
-    controls appear directly under the relevant item/section while preserving
-    header/footer text as plain messages.
+    the bottom. For scheduled Pulse briefs, split numbered/bulleted item blocks,
+    inline-ID item lines, or markdown synthesis sections into separate delivery
+    units so feedback controls appear directly under the relevant item/section
+    while preserving header/footer text as plain messages.
+
+    Three splitter strategies, tried in order, fall through to a single-message
+    fallback so the user always sees at least one keyboard:
+
+    1. ``_split_numbered_list_for_delivery`` — strict numbered/bullet items
+       (back-compat for older briefs that wrote `1. PID text`).
+    2. ``_split_inline_id_for_delivery`` — any line containing a Pulse ID,
+       grouped with up to ``MAX_ITEM_CONTEXT_LINES`` following non-blank lines.
+       Catches the **PID** (Source) — ... shape that the current agents emit.
+    3. ``_split_heading_sections_for_delivery`` — `### heading` body `IDs:`
+       shape used by weekly synthesis and market-mode themed blocks.
+    4. Fallback: single message with the full-brief keyboard so the user at
+       least sees a thumbs-up/down control, never a button-less wall of text.
     """
     if not text or not text.strip():
         return []
 
+    # Strategy 1: numbered/bulleted item lines (existing behavior).
+    numbered_units = _filter_junk_units(_split_numbered_list_for_delivery(text))
+    if _count_units_with_buttons(numbered_units) > 1:
+        return numbered_units
+
+    # Strategy 2: any line that contains a Pulse ID (the shape the current
+    # agents actually emit: `**PID** (Source) — ...`).
+    inline_units = _filter_junk_units(_split_inline_id_for_delivery(text))
+    if _count_units_with_buttons(inline_units) > 1:
+        return inline_units
+
+    # Strategy 3: heading-section split (weekly synthesis, market-mode blocks).
+    section_units = _filter_junk_units(_split_heading_sections_for_delivery(text))
+    if _count_units_with_buttons(section_units) > 1:
+        return section_units
+
+    # Fallback: at minimum, return a single message with the full-brief
+    # keyboard. The user should always have *some* controls. If there are no
+    # IDs at all, return plain text (no empty keyboard).
+    if extract_item_ids(text):
+        metadata = metadata_for_brief(text)
+        return [{"text": text.strip(), "metadata": metadata}]
+    return [{"text": text.strip(), "metadata": None}]
+
+
+def _count_units_with_buttons(units: list[dict[str, Any]]) -> int:
+    """Count delivery units that would render an inline keyboard."""
+    return sum(1 for unit in units if unit.get("metadata"))
+
+
+def _split_numbered_list_for_delivery(text: str) -> list[dict[str, Any]]:
+    """Strategy 1: numbered/bulleted item lines (strict, back-compat)."""
     lines = text.splitlines()
     units: list[dict[str, Any]] = []
     plain_buffer: list[str] = []
@@ -385,16 +477,228 @@ def split_brief_for_delivery(text: str) -> list[dict[str, Any]]:
         i += 1
 
     flush_plain()
+    # Return the units with item_count embedded for the caller to count buttons.
+    return units
 
-    if item_count > 1:
-        return units
 
-    section_units = _split_heading_sections_for_delivery(text)
-    if len([unit for unit in section_units if unit.get("metadata")]) > 1:
-        return section_units
+def _split_inline_id_for_delivery(text: str) -> list[dict[str, Any]]:
+    """Strategy 2: split on any line that contains a Pulse item ID.
 
-    metadata = metadata_for_brief(text)
-    return [{"text": text.strip(), "metadata": metadata}]
+    Two item shapes are supported:
+
+    1. **Item-line shape** — ``**PID** (Source) — sentence. sentence. sentence.``
+       The ID line is the start of a new item. The unit contains the ID line
+       plus up to ``MAX_ITEM_CONTEXT_LINES`` following non-blank lines, then
+       stops on the next ID line / break.
+    2. **Section-with-IDs shape** — ``**Header**\n\nbody paragraphs\n\nIDs: PID1 PID2``
+       The IDs line is the LAST line of a themed block. The unit absorbs the
+       preceding plain-buffer content (up to the prior boundary) so the body
+       and the IDs line land in one Telegram message with the keyboard
+       rendered directly under the IDs line. The user sees the full themed
+       block (header + body + IDs) followed by 👍/👎/Hide/Explain.
+
+    Lines that don't carry an ID and don't belong to a pending block accumulate
+    in a plain buffer. Each plain buffer flush is a plain (no-keyboard) unit
+    used for the brief's intro, position snapshot, and footer.
+
+    Filter rule: at the end, drop any unit whose text is just a horizontal
+    rule or pure whitespace, so trailing ``---`` separators do not produce
+    empty Telegram messages.
+    """
+    lines = text.splitlines()
+    units: list[dict[str, Any]] = []
+    plain_buffer: list[str] = []
+    i = 0
+
+    def flush_plain() -> None:
+        nonlocal plain_buffer
+        block = "\n".join(plain_buffer).strip()
+        if block:
+            units.append({"text": block, "metadata": None})
+        plain_buffer = []
+
+    def is_break(line: str) -> bool:
+        if not line.strip():
+            return True
+        if PULSE_HORIZONTAL_RULE_RE.match(line):
+            return True
+        if PULSE_SECTION_HEADING_RE.match(line):
+            return True
+        if PULSE_BOLD_HEADER_RE.match(line):
+            return True
+        return False
+
+    def _looks_like_session_header(line: str) -> bool:
+        """True if a line looks like the brief's session-level header.
+
+        Examples:
+
+        - ``**Pulse Market Premarket — 2026-06-09**``
+        - ``**Pulse Daily — Tue 2026-06-09**``
+        - ``**Pulse Market End of Day — 2026-06-09**``
+        - ``**Pulse Weekly — 2026-06-09**``
+        - ``**Pulse Emergency — <event>**``
+
+        The session header is a one-line title at the top of the brief
+        and should not be absorbed into a themed block. It lives in its
+        own plain-text unit above the first thematic section.
+        """
+        stripped = line.strip()
+        if not (stripped.startswith("**") and stripped.endswith("**")):
+            return False
+        inner = stripped[2:-2].strip()
+        lower = inner.lower()
+        return lower.startswith("pulse ")
+
+    def pop_section_body() -> tuple[list[str], bool, bool]:
+        """Pop trailing body lines from the plain buffer to attach to a
+        following ``IDs:`` line. Stops at the most recent boundary so we
+        never absorb content that belongs to a different block. The
+        boundary line itself (bold header / `##` heading) is included in
+        the absorbed body so the section title lands inside the unit.
+
+        A horizontal rule ``---`` is a HARD boundary — we never cross it
+        backwards. The session-level intro (date header, position
+        snapshot) lives above the first ``---`` and must stay in its own
+        plain-text unit, not be absorbed into a section.
+
+        A line that looks like a session header (``**Pulse <something>**``)
+        is also a boundary: the session header belongs in its own plain
+        unit and we never absorb it into a section. We return
+        ``hit_session_header=True`` in that case so the caller can put
+        the session header back into the plain buffer for a clean
+        flush later.
+
+        Returns ``(absorbed_lines, hit_section_header, hit_session_header)``.
+        The absorbed lines are in source order (top-to-bottom).
+        """
+        nonlocal plain_buffer
+        # We pop from the END of plain_buffer, but we want the absorbed
+        # lines in source order, so we collect into a side buffer and
+        # reverse at the end.
+        popped: list[str] = []
+        # First pass: pop a single trailing blank separator between the
+        # body and the IDs line. A second blank line means we have
+        # crossed into the next section.
+        if plain_buffer and not plain_buffer[-1].strip():
+            popped.append(plain_buffer.pop())
+        if not plain_buffer:
+            return list(reversed(popped)), False, False
+        # If the line directly above the trailing blank is a hard
+        # boundary (horizontal rule), do NOT cross it.
+        if PULSE_HORIZONTAL_RULE_RE.match(plain_buffer[-1]):
+            return list(reversed(popped)), False, False
+        # Second pass: pop body content lines until we hit a boundary
+        # (a bold header / `##` heading / horizontal rule) or run out of
+        # buffer. A horizontal rule is hard-stop; we don't include it in
+        # the absorbed body. A bold header / `##` heading IS the title
+        # of this section and IS included.
+        hit_section_header = False
+        hit_session_header = False
+        while plain_buffer:
+            tail = plain_buffer[-1]
+            if PULSE_HORIZONTAL_RULE_RE.match(tail):
+                # Hard boundary. Drop everything absorbed so far.
+                popped.clear()
+                return [], False, False
+            if PULSE_SECTION_HEADING_RE.match(tail) or PULSE_BOLD_HEADER_RE.match(tail):
+                if _looks_like_session_header(tail):
+                    # Session header — keep it in the plain buffer.
+                    popped.clear()
+                    return [], False, True
+                # Section title — include it in the unit.
+                popped.append(plain_buffer.pop())
+                hit_section_header = True
+                break
+            popped.append(plain_buffer.pop())
+        return list(reversed(popped)), hit_section_header, hit_session_header
+
+    while i < len(lines):
+        line = lines[i]
+        ids_on_line = extract_item_ids(line)
+        if ids_on_line:
+            # If this is an `IDs:`-style aggregator line, pull the preceding
+            # body back into the same unit so the keyboard lands at the
+            # bottom of the whole section. The session-level header (if
+            # any) stays in the plain buffer and flushes as its own
+            # plain unit, so the user sees the brief title above the
+            # first thematic block.
+            if PULSE_IDS_LINE_RE.match(line):
+                body_lines, _hit_header, hit_session = pop_section_body()
+                if hit_session:
+                    # Put the IDs line itself back into the plain buffer
+                    # for the next flush attempt (the section body
+                    # above the session header is in the plain buffer
+                    # too, but the IDs line is the "title" of this
+                    # orphaned block — easier to just attach it after a
+                    # new flush once the body is rebuilt). For now,
+                    # treat the IDs line as its own plain unit.
+                    units.append({"text": line.strip(), "metadata": None})
+                    i += 1
+                    while i < len(lines) and not lines[i].strip():
+                        i += 1
+                    continue
+                block_lines = body_lines + [line]
+                block = "\n".join(block_lines).strip()
+                metadata = _metadata_for_item_block(block)
+                units.append({"text": block, "metadata": metadata})
+                i += 1
+                while i < len(lines) and not lines[i].strip():
+                    i += 1
+                continue
+
+            # Plain item-line: flush prior plain buffer, then start a new
+            # unit with up to MAX_ITEM_CONTEXT_LINES following context.
+            flush_plain()
+            block_lines = [line]
+            j = i + 1
+            context_lines = 0
+            while j < len(lines) and context_lines < MAX_ITEM_CONTEXT_LINES:
+                nxt = lines[j]
+                if is_break(nxt):
+                    break
+                # Stop if the next non-blank line starts a NEW item (different
+                # ID or IDs-line). We allow a same-line `IDs:` continuation
+                # but not a paragraph that introduces another item.
+                if PULSE_ID_LINE_RE.search(nxt):
+                    break
+                block_lines.append(nxt)
+                context_lines += 1
+                j += 1
+            block = "\n".join(block_lines).strip()
+            metadata = _metadata_for_item_block(block)
+            units.append({"text": block, "metadata": metadata})
+            # Skip blank lines between items so the next iteration lands on
+            # the next ID line, not on whitespace.
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            i = j
+            continue
+
+        plain_buffer.append(line)
+        i += 1
+
+    flush_plain()
+    return _filter_junk_units(units)
+
+
+def _filter_junk_units(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop units whose text is empty, whitespace, or just a horizontal rule.
+
+    Without this, a brief that ends with ``---`` produces a trailing empty
+    Telegram message. Horizontal rules are section separators in the source
+    markdown; they should never be the *content* of a delivery unit.
+    """
+    cleaned: list[dict[str, Any]] = []
+    for unit in units:
+        text = (unit.get("text") or "").strip()
+        if not text:
+            continue
+        if PULSE_HORIZONTAL_RULE_RE.match(text):
+            continue
+        cleaned.append(unit)
+    return cleaned
+
 
 def _load_recent_item(item_id: str) -> dict[str, Any]:
     try:
@@ -413,21 +717,174 @@ def _load_recent_item(item_id: str) -> dict[str, Any]:
 
 
 def _format_explain_followup(item_id: str) -> str:
+    """Build a substantive explain follow-up that does real investigation.
+
+    Two paths converge here:
+
+    - Telegram inline button tap (``pulse:explain:<ID>``) — runs in the gateway
+      callback context, no main agent loop is available. We do a real
+      investigation synchronously: pull the item from local state, fetch the
+      source URL via curl, pull portfolio context, and compose a 4-8 sentence
+      response. Falls back to a clear "what we have on file" snapshot if the
+      fetch fails.
+    - Chat command ``Pulse explain <ID>`` — handled by the live agent in the
+      same chat session; the response below is also what the user sees first
+      while the agent prepares a deeper turn.
+    """
     item = _load_recent_item(item_id)
     if not item:
-        return f"Pulse item {item_id}: I could not find recent local item context. Reply `Pulse explain {item_id}` if you want me to investigate it live."
-    title = item.get("title") or item.get("headline") or "Untitled item"
-    source = item.get("source") or item.get("source_id") or "unknown source"
-    url = item.get("url") or ""
+        return (
+            f"🔍 Pulse explain {item_id}\n"
+            f"No recent local context for this item (it may be older than the "
+            f"keep-window or from a brief type that does not persist per-item state).\n"
+            f"Reply with any follow-up and I will investigate live: web-search the "
+            f"topic, pull the strongest primary source, and cross-check your portfolio "
+            f"when relevant. `Pulse mute {item_id}` to silence future repeats."
+        )
+
+    title = (item.get("title") or item.get("headline") or "Untitled item").strip()
+    source = (item.get("source") or item.get("source_id") or "unknown source").strip()
+    url = (item.get("url") or "").strip()
     topics = item.get("topics") or []
-    topics_text = ", ".join(topics) if isinstance(topics, list) else str(topics)
-    return "\n".join(part for part in [
-        f"Pulse item {item_id}",
-        f"Title: {title}",
-        f"Source: {source}",
-        f"Topics: {topics_text}" if topics_text else "",
-        f"URL: {url}" if url else "",
-    ] if part)
+    if isinstance(topics, list):
+        topics_text = ", ".join(str(t) for t in topics if str(t).strip())
+    else:
+        topics_text = str(topics)
+    published = (item.get("published") or "").strip()
+    summary_hint = (item.get("summary_hint") or "").strip()
+    source_score = item.get("source_score")
+    score = item.get("score")
+    score_line_parts = []
+    if isinstance(source_score, (int, float)):
+        score_line_parts.append(f"source_score={source_score:.2f}")
+    if isinstance(score, (int, float)):
+        score_line_parts.append(f"weighted_score={score:.2f}")
+    score_line = " · ".join(score_line_parts)
+
+    # Real investigation: fetch the source URL, then pull portfolio context
+    # if the item is in an adjacent topic. Both have hard timeouts and degrade
+    # gracefully so a flaky network never breaks the explain button.
+    fetched_excerpt = _fetch_url_excerpt(url) if url else ""
+    portfolio_block = _portfolio_impact_for_topics(topics_text) if _is_portfolio_adjacent(topics_text) else ""
+
+    lines = [f"🔍 Pulse explain {item_id}"]
+    lines.append(f"Title: {title}")
+    if topics_text:
+        lines.append(f"Topics: {topics_text}")
+    lines.append(f"Source: {source}" + (f"  ·  {score_line}" if score_line else ""))
+    if published:
+        lines.append(f"Published: {published}")
+
+    if fetched_excerpt:
+        lines.append("")
+        lines.append("What the source says:")
+        lines.append(fetched_excerpt)
+    elif summary_hint:
+        lines.append("")
+        lines.append(f"What we have on file: {summary_hint}")
+    if url:
+        lines.append(f"URL: {url}")
+
+    if portfolio_block:
+        lines.append("")
+        lines.append("Held-position read:")
+        lines.append(portfolio_block)
+
+    lines.append("")
+    lines.append(
+        "Reply in chat with a follow-up (e.g. \"why does this matter for VGT?\" or "
+        "\"what changed since the last brief?\") and I will pull the source, "
+        "corroborate with a second outlet, and check your held positions. "
+        f"`Pulse mute {item_id}` to silence future repeats; `Pulse up {item_id}` to "
+        "see more like this."
+    )
+    return "\n".join(lines)
+
+
+def _fetch_url_excerpt(url: str, *, max_chars: int = 1200, timeout: int = 5) -> str:
+    """Fetch a URL with curl and return a short text excerpt.
+
+    Hard timeout so a slow server cannot stall the Telegram callback handler.
+    Returns an empty string on any failure — callers must degrade gracefully.
+    """
+    if not url or not url.startswith(("http://", "https://")):
+        return ""
+    try:
+        proc = subprocess.run(
+            [
+                "curl",
+                "-sL",
+                "--max-time",
+                str(timeout),
+                "-A",
+                "Mozilla/5.0 (compatible; HermesPulse/1.0)",
+                url,
+            ],
+            text=True,
+            capture_output=True,
+            timeout=timeout + 2,
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("Pulse explain: curl failed for %s: %s", url, exc)
+        return ""
+    if proc.returncode != 0 or not proc.stdout:
+        return ""
+    # Strip tags, collapse whitespace, truncate. Good enough for a 1-2 sentence
+    # excerpt; the agent turn can do a deeper fetch.
+    text = re.sub(r"<script\b[^>]*>.*?</script>", " ", proc.stdout, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<style\b[^>]*>.*?</style>", " ", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return ""
+    if len(text) > max_chars:
+        # Cut on a sentence boundary near the cap for readability.
+        cut = text[:max_chars]
+        last_period = max(cut.rfind(". "), cut.rfind("。 "))
+        if last_period > max_chars // 2:
+            cut = cut[: last_period + 1]
+        text = cut.rstrip() + "…"
+    return text
+
+
+def _is_portfolio_adjacent(topics_text: str) -> bool:
+    """True if the topics suggest market/company/macro/cyber relevance."""
+    if not topics_text:
+        return False
+    keywords = (
+        "markets", "macro", "equities", "credit", "semiconductors",
+        "energy_climate", "energy", "geopolitics", "us_policy", "policy",
+        "finance", "cybersecurity", "cyber", "business", "ai_models",
+        "ai_agents",
+    )
+    lower = topics_text.lower()
+    return any(k in lower for k in keywords)
+
+
+def _portfolio_impact_for_topics(topics_text: str) -> str:
+    """Read positions and quote a 1-2 line held-position impact.
+
+    Falls back to an empty string if the portfolio tool is unavailable.
+    """
+    try:
+        proc = subprocess.run(
+            ["st", "portfolio", "briefing-context", "--limit", "10", "--catalyst-days", "14"],
+            text=True,
+            capture_output=True,
+            timeout=8,
+            check=False,
+        )
+    except Exception as exc:
+        logger.debug("Pulse explain: st portfolio failed: %s", exc)
+        return ""
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return ""
+    # Trim to the most relevant signal: top 4 lines / first 600 chars.
+    snippet = proc.stdout.strip()
+    if len(snippet) > 600:
+        snippet = snippet[:600].rstrip() + "…"
+    return snippet
 
 
 async def dispatch_callback(data: str) -> tuple[bool, str, str | None]:
@@ -461,7 +918,7 @@ async def dispatch_callback(data: str) -> tuple[bool, str, str | None]:
 
 def _load(path: Path, default: Any) -> Any:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return default
 

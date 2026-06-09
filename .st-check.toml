@@ -1,0 +1,5 @@
+# st check configuration for hermes-agent.
+# hermes-agent's pytest setup does not install pytest-cov, so disable
+# st check's auto-injected --no-cov flag.
+[pytest]
+no_cov = false
