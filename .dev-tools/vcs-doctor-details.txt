@@ -1,0 +1,73 @@
+{
+  "cleanup": {
+    "checkpoints": [],
+    "repositories": [],
+    "summary": {
+      "active_checkpoints": 0,
+      "dirty_checkpoints": 0,
+      "orphan_task_branches": 0,
+      "prunable_task_branches": 0,
+      "repos": 0,
+      "repos_needing_cleanup": 0,
+      "snapshot_residue": 0,
+      "stale_checkpoints": 0
+    },
+    "total": 0
+  },
+  "git": [
+    {
+      "ahead": 0,
+      "behind": 0,
+      "branch": "main",
+      "name": "test3",
+      "path": "/srv/workspaces/projects/test3",
+      "project_id": "test3",
+      "state": "clean",
+      "uncommitted": 0,
+      "workspace_summary": {
+        "active_checkpoints": 0,
+        "branches_with_checkpoints": 0,
+        "checkpoint_task_ids": [],
+        "dirty_checkpoints": 0,
+        "dirty_main_repo": false,
+        "needs_cleanup": false,
+        "orphan_branch_names": [],
+        "orphan_branches": 0,
+        "orphan_details": [],
+        "prunable_branch_names": [],
+        "prunable_branches": 0,
+        "review_orphan_task_ids": [],
+        "salvage_task_ids": []
+      }
+    }
+  ],
+  "issues": [],
+  "jj": [
+    {
+      "branch": "main",
+      "change_id": "-",
+      "colocated": false,
+      "commit_id": "-",
+      "conflicted": false,
+      "described": false,
+      "path": "/srv/workspaces/projects/test3",
+      "repo": "test3",
+      "state": "not_colocated",
+      "unpublished": 0
+    }
+  ],
+  "summary": {
+    "ahead": 0,
+    "behind": 0,
+    "cleanup": 0,
+    "conflicts": 0,
+    "dirty": 0,
+    "repos": 1,
+    "task_refs": 0,
+    "unmanaged": 0,
+    "unpublished": 0
+  },
+  "sync": [],
+  "task_refs": [],
+  "unmanaged": []
+}

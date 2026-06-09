@@ -1,0 +1,8 @@
+# st check configuration for hermes-agent.
+# See [[st-check-config]] in the vault wiki for the schema.
+#
+# The dev extra (pytest, ruff, etc.) lives in `.venv/` but pytest-cov is not
+# installed, so we opt out of the auto-injected `--no-cov` flag that `st
+# check pytest` would otherwise prepend to every path-targeted test run.
+[pytest]
+no_cov = false
